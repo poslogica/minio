@@ -8,8 +8,9 @@
 # scan gate found 17 Critical / 69 High CVEs in it, nearly all in the Go
 # stdlib and vendored Go modules rather than MinIO's own code. This builds
 # the fork's branch from source with a current Go toolchain and the
-# vulnerable modules bumped in go.mod (see govulncheck), onto a distroless
-# base with no shell or package manager.
+# vulnerable modules bumped in go.mod (see govulncheck), onto a scratch
+# image with no shell or package manager (runtime files from our own Debian
+# base -- see the rootfs stage).
 #
 # Version stamping: .dockerignore excludes .git, so buildscripts/
 # gen-ldflags.go can't read the commit here. The caller passes
@@ -18,6 +19,11 @@
 #
 #   docker build -f Dockerfile.sonicsort \
 #     --build-arg COMMIT_ID=$(git rev-parse HEAD) -t sonicsort-minio:local .
+
+# Base for the runtime-files stage (rootfs, below). SonicSort passes
+# sonicsort-debian:local -- its own trixie-slim from poslogica/debuerreotype;
+# the default is the public image of the same variant.
+ARG DEBIAN_BASE=debian:trixie-slim
 
 FROM golang:1.27-alpine AS build
 
@@ -44,7 +50,7 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
       -X github.com/minio/minio/cmd.ShortCommitID=${SHORT} \
       -X github.com/minio/minio/cmd.CopyrightYear=2025" .
 
-# Stand-in for upstream's `mc ready local` healthcheck: distroless has no
+# Stand-in for upstream's `mc ready local` healthcheck: the scratch runtime has no
 # shell/curl/mc, and shipping mc would bring its own Go dependency tree (and
 # CVEs) along. Stdlib only.
 WORKDIR /healthcheck
@@ -72,10 +78,46 @@ EOF
 RUN --mount=type=cache,target=/root/.cache/go-build \
     go mod init healthcheck && go build -trimpath -ldflags "-s -w" -o /out/minio-healthcheck .
 
-# Runs as root, like the upstream image: existing SonicSort data volumes
-# are root-owned. Non-root is tracked separately (sonicsort #155).
-FROM gcr.io/distroless/static-debian13
+# Runtime filesystem for the scratch image below, assembled on SonicSort's own
+# Debian base (sonicsort-debian:local, from poslogica/debuerreotype) in place of
+# gcr.io/distroless/static-debian13. Same contents distroless/static gives a
+# static Go binary: CA certificates, tzdata, mime types, services/protocols,
+# passwd/group (root, nobody, nonroot) and a 1777 /tmp -- plus the dpkg
+# status.d entries and os-release that let scanners see those packages.
+FROM ${DEBIAN_BASE} AS rootfs
+# Weekly cache-buster (SonicSort's build scripts pass the current ISO week),
+# so the packages copied below are re-fetched at least weekly.
+ARG OS_PATCH_WEEK=unset
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates tzdata media-types netbase; \
+    mkdir -p /out/etc/ssl/certs /out/usr/share /out/usr/lib /out/var/lib/dpkg/status.d /out/tmp; \
+    cp /etc/ssl/certs/ca-certificates.crt /out/etc/ssl/certs/; \
+    cp -a /usr/share/zoneinfo /out/usr/share/; \
+    cp /etc/mime.types /etc/services /etc/protocols /etc/nsswitch.conf /out/etc/; \
+    cp /usr/lib/os-release /out/usr/lib/; \
+    ln -s ../usr/lib/os-release /out/etc/os-release; \
+    for pkg in base-files ca-certificates tzdata media-types netbase; do \
+        dpkg-query --status "$pkg" > "/out/var/lib/dpkg/status.d/$pkg"; \
+    done; \
+    chmod 1777 /out/tmp; \
+    rm -rf /var/lib/apt/lists/*
+COPY <<'EOF' /out/etc/passwd
+root:x:0:0:root:/root:/sbin/nologin
+nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin
+nonroot:x:65532:65532:nonroot:/home/nonroot:/sbin/nologin
+EOF
+COPY <<'EOF' /out/etc/group
+root:x:0:
+nobody:x:65534:
+nonroot:x:65532:
+EOF
 
+# Runs as root, like the upstream image: existing SonicSort data volumes
+# are root-owned. Non-root is tracked separately (sonicsort #154).
+FROM scratch
+
+COPY --from=rootfs /out/ /
 COPY --from=build /out/minio /out/minio-healthcheck /usr/bin/
 
 EXPOSE 9000 9001
