@@ -1,0 +1,85 @@
+# syntax=docker/dockerfile:1
+#
+# Source build of this fork for SonicSort (poslogica/sonicsort), which uses
+# MinIO as its S3-compatible object store.
+#
+# Upstream minio/minio is archived: its last image (quay.io/minio/minio,
+# RELEASE.2025-09-07, go1.24.6) will never be rebuilt, and SonicSort's image
+# scan gate found 17 Critical / 69 High CVEs in it, nearly all in the Go
+# stdlib and vendored Go modules rather than MinIO's own code. This builds
+# the fork's branch from source with a current Go toolchain and the
+# vulnerable modules bumped in go.mod (see govulncheck), onto a distroless
+# base with no shell or package manager.
+#
+# Version stamping: .dockerignore excludes .git, so buildscripts/
+# gen-ldflags.go can't read the commit here. The caller passes
+# RELEASE_TAG/COMMIT_ID instead, in the same
+# "RELEASE.<date>.hotfix.<sha>" form the Makefile's hotfix target uses.
+#
+#   docker build -f Dockerfile.sonicsort \
+#     --build-arg COMMIT_ID=$(git rev-parse HEAD) -t sonicsort-minio:local .
+
+FROM golang:1.27-alpine AS build
+
+ARG RELEASE_TAG=RELEASE.2025-10-15T17-29-55Z
+ARG COMMIT_ID=unknown
+
+ENV CGO_ENABLED=0 GOTOOLCHAIN=local
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+
+COPY . .
+
+# Version is the RFC3339 form of the release tag's date (what upstream's
+# gen-ldflags.go derives from it).
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    VERSION=$(echo "${RELEASE_TAG}" | sed -E 's/^RELEASE\.([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{2})-([0-9]{2})-([0-9]{2})Z.*/\1T\2:\3:\4Z/') && \
+    SHORT=$(echo "${COMMIT_ID}" | cut -c1-12) && \
+    go build -tags kqueue -trimpath -o /out/minio -ldflags "-s -w \
+      -X github.com/minio/minio/cmd.Version=${VERSION} \
+      -X github.com/minio/minio/cmd.ReleaseTag=${RELEASE_TAG}.hotfix.${SHORT} \
+      -X github.com/minio/minio/cmd.CommitID=${COMMIT_ID} \
+      -X github.com/minio/minio/cmd.ShortCommitID=${SHORT} \
+      -X github.com/minio/minio/cmd.CopyrightYear=2025" .
+
+# Stand-in for upstream's `mc ready local` healthcheck: distroless has no
+# shell/curl/mc, and shipping mc would bring its own Go dependency tree (and
+# CVEs) along. Stdlib only.
+WORKDIR /healthcheck
+COPY <<'EOF' main.go
+package main
+
+import (
+	"net/http"
+	"os"
+	"time"
+)
+
+func main() {
+	url := "http://127.0.0.1:9000/minio/health/live"
+	if len(os.Args) > 1 {
+		url = os.Args[1]
+	}
+	client := http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		os.Exit(1)
+	}
+}
+EOF
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    go mod init healthcheck && go build -trimpath -ldflags "-s -w" -o /out/minio-healthcheck .
+
+# Runs as root, like the upstream image: existing SonicSort data volumes
+# are root-owned. Non-root is tracked separately (sonicsort #155).
+FROM gcr.io/distroless/static-debian13
+
+COPY --from=build /out/minio /out/minio-healthcheck /usr/bin/
+
+EXPOSE 9000 9001
+VOLUME ["/data"]
+
+ENTRYPOINT ["/usr/bin/minio"]
+CMD ["server", "/data"]
