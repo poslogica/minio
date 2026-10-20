@@ -100,7 +100,7 @@ RUN set -eux; \
     for pkg in base-files ca-certificates tzdata media-types netbase; do \
         dpkg-query --status "$pkg" > "/out/var/lib/dpkg/status.d/$pkg"; \
     done; \
-    chmod 1777 /out/tmp; \
+    chmod 1777 /out/tmp;     install -d -o 65532 -g 65532 /out/data /out/home/nonroot; \
     rm -rf /var/lib/apt/lists/*
 COPY <<'EOF' /out/etc/passwd
 root:x:0:0:root:/root:/sbin/nologin
@@ -113,8 +113,11 @@ nobody:x:65534:
 nonroot:x:65532:
 EOF
 
-# Runs as root, like the upstream image: existing SonicSort data volumes
-# are root-owned. Non-root is tracked separately (sonicsort #154).
+# Runs as distroless's nonroot user (uid/gid 65532, defined in the passwd and
+# group above) rather than root (sonicsort #154). /data and its home
+# (~/.minio, where MinIO looks for TLS certs) are created owned by it above.
+# A data volume created while MinIO ran as root must be handed to 65532 once:
+# SonicSort's compose file and k8s manifest do that before MinIO starts.
 FROM scratch
 
 COPY --from=rootfs /out/ /
@@ -123,5 +126,6 @@ COPY --from=build /out/minio /out/minio-healthcheck /usr/bin/
 EXPOSE 9000 9001
 VOLUME ["/data"]
 
+USER 65532:65532
 ENTRYPOINT ["/usr/bin/minio"]
 CMD ["server", "/data"]
